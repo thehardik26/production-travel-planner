@@ -1,0 +1,51 @@
+# Phase 1 - config
+# pydantic pinned as a floor, not exact, because the exact-pin (2.10.3)
+# predates prebuilt Windows wheels for newer Python versions - pip then
+# tries to compile pydantic-core from Rust source, which fails without
+# a Rust toolchain + MSVC Build Tools installed. >= lets pip pick the
+# newest release, which ships a prebuilt wheel for your Python version.
+pydantic>=2.11.0
+pydantic-settings>=2.6.1
+python-dotenv==1.0.1
+
+# Phase 2 - Postgres data layer
+sqlalchemy==2.0.36
+# same reasoning as pydantic above: 0.30.0 has no prebuilt wheel for
+# newer Python versions on Windows and fails to compile without MSVC
+# Build Tools. >=0.31.0 is the first asyncpg release with those wheels.
+asyncpg>=0.31.0
+alembic==1.14.0
+# SQLAlchemy's async engine (create_async_engine, AsyncSession) runs sync
+# DB-driver code in a background greenlet under the hood - it's a real
+# runtime dependency, not optional, even though pip doesn't always pull
+# it in automatically alongside plain `sqlalchemy`.
+greenlet>=3.0.0
+
+# Phase 3 - API server + auth
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+email-validator==2.2.0
+
+# Phase 4 - MCP HTTP clients, Redis caching, rate limiting
+mcp==1.12.4
+redis==5.2.1
+slowapi==0.1.9
+tenacity==9.0.0
+
+# Phase 5 - LangGraph orchestration, Postgres-backed checkpointing, Groq LLM
+langgraph==1.2.9
+langgraph-checkpoint-postgres==3.1.0
+# psycopg (v3) is what langgraph-checkpoint-postgres uses internally -
+# separate from asyncpg, which SQLAlchemy uses for our own users/trips
+# queries. [binary] avoids needing a C compiler / libpq installed.
+psycopg[binary]==3.3.4
+groq==1.5.0
+
+# Phase 9 - testing. httpx itself isn't pinned here - it's already a
+# transitive dep of `mcp` (used directly in app/mcp_clients/base.py) -
+# only the test-specific packages are added.
+pytest==8.3.4
+pytest-asyncio==0.25.2

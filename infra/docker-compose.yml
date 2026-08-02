@@ -1,0 +1,52 @@
+# Phase 1 — Foundation. Spins up the three stateful services every later
+# phase depends on: Postgres (durable data, Phase 2/5), Redis (cache,
+# used from Phase 4 onward), Qdrant (vector search, Phase 6). We start
+# them now, all at once, so every later phase just connects to something
+# already running instead of provisioning infra mid-feature-work.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: travel-planner-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-travel_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-travel_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-travel_planner}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-travel_admin}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: travel-planner-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: travel-planner-qdrant
+    restart: unless-stopped
+    ports:
+      - "6335:6333"  # REST API
+      - "6336:6334"  # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
