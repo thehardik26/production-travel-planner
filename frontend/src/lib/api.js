@@ -8,10 +8,10 @@
  */
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
-const TOKEN_KEY = 'wanderplan_token'
+const TOKEN_KEY = 'aura_travel_token'
 
 export function getToken() {
-  return localStorage.getItem(TOKEN_KEY)
+  return localStorage.getItem(TOKEN_KEY) || localStorage.getItem('wanderplan_token')
 }
 
 export function setToken(token) {
@@ -20,6 +20,13 @@ export function setToken(token) {
 
 export function clearToken() {
   localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem('wanderplan_token')
+}
+
+function _handleUnauthorized() {
+  clearToken()
+  window.dispatchEvent(new Event('aura:unauthorized'))
+  window.dispatchEvent(new Event('wanderplan:unauthorized'))
 }
 
 class ApiError extends Error {
@@ -46,6 +53,7 @@ async function request(path, { method = 'GET', body, auth = false } = {}) {
   const data = isJson ? await res.json().catch(() => null) : null
 
   if (!res.ok) {
+    if (res.status === 401 && auth) _handleUnauthorized()
     // FastAPI's HTTPException shape is {"detail": "..."} - that's the
     // human-readable message worth surfacing in the UI.
     const message = data?.detail || res.statusText || 'Something went wrong'

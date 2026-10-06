@@ -78,9 +78,37 @@ The frontend now shows a "Test data" badge next to any budget number derived fro
 
 ## 7. What's built vs. what's deferred
 
-**Built:** foundation infra (Docker Compose: Postgres/Redis/Qdrant), Postgres schema + Alembic migrations, JWT auth, all 5 MCP tool servers as independent HTTP services with Redis caching and retries, the LangGraph multi-agent pipeline with a budget guardrail, and a React frontend.
+**Built:** foundation infra (Docker Compose: Postgres/Redis/Qdrant), Postgres schema + Alembic migrations, JWT auth, all 5 MCP tool servers as independent HTTP services with Redis caching and retries, the LangGraph multi-agent pipeline with a budget guardrail, a React frontend, and (21 Aug 2026) Phase 6 — RAG destination-guide retrieval.
 
-**Not built yet:** Phase 6 (RAG — Qdrant hybrid dense/sparse retrieval, deferred until everything above is verified end to end), Phase 7 (LangSmith observability), Phase 8 (full CI/CD), Phase 9 (broader test hardening).
+Phase 6, as actually built, differs from the original blueprint in a
+few deliberate ways worth knowing before reading `app/rag/`:
+
+- **Local embeddings/reranking, not OpenAI.** `BAAI/bge-small-en-v1.5`
+  (dense) + `BAAI/bge-reranker-base` (cross-encoder), both via
+  `sentence-transformers`, no API key required — matches every other
+  free-tier choice in this project (Groq, Open-Meteo, OSM).
+- **Scope is destination guides, not user memory.** One Qdrant
+  collection (`destination_guides`), seeded from a small hand-written
+  corpus in `app/rag/knowledge_base.py` covering the cities
+  `intent_agent.py`'s heuristic fallback already recognizes. That
+  corpus is illustrative starter content, not verified live data — see
+  `knowledge_base.py`'s own docstring before trusting it for real users.
+- **Wired into ResearchAgent, not a separate graph node.** A sixth
+  concurrent, independently-failing lookup alongside the 5 MCP tools
+  (`app/rag/destination_guide.py`), not a new LangGraph node — it
+  fails the same way the tools do, so it needed the same handling, not
+  new handling.
+- **BM25 keeps working even if Qdrant doesn't**, and vice versa — the
+  two legs of hybrid retrieval are independently try/excepted end to
+  end (see `retrieval.py` and `ingest.py`'s `ensure_ready()`), and each
+  local model gets one bounded (20s) load attempt per process, not a
+  retry on every request, if it can't be reached.
+- The rule-based scheduling fallback (used when Groq is unavailable)
+  now pulls a real line from the destination guide instead of the old
+  generic "Free day - explore locally", when there's no attraction data
+  to schedule either.
+
+**Not built yet:** Phase 7 (LangSmith observability), Phase 8 (full CI/CD), Phase 9 (broader test hardening).
 
 ## 8. One good in-class exercise
 

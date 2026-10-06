@@ -43,6 +43,23 @@ langgraph-checkpoint-postgres==3.1.0
 # queries. [binary] avoids needing a C compiler / libpq installed.
 psycopg[binary]==3.3.4
 groq==1.5.0
+# Optional alternate LLM provider - see app/core/llm.py's LLM_PROVIDER
+# setting. Only actually called if LLM_PROVIDER=openai, but installed
+# unconditionally so switching is a .env change, not a redeploy.
+openai==1.58.1
+
+# Phase 6 - RAG (destination-guide hybrid retrieval). sentence-transformers
+# pulls in torch (CPU build is fine, no GPU needed for bge-small/base) -
+# this is the single biggest addition to the image size in this file, so
+# it's worth knowing about before the Azure deploy step, not being
+# surprised by it there. qdrant-client talks to the Qdrant container
+# already provisioned in infra/docker-compose.yml; rank-bm25 is the
+# sparse half of hybrid retrieval. No langchain dependency - chunking.py
+# is a small hand-rolled paragraph splitter, deliberately not pulling in
+# a whole framework for one function's worth of logic.
+sentence-transformers==3.3.1
+qdrant-client==1.12.1
+rank-bm25==0.2.2
 
 # Phase 9 - testing. httpx itself isn't pinned here - it's already a
 # transitive dep of `mcp` (used directly in app/mcp_clients/base.py) -

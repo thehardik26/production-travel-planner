@@ -23,3 +23,5 @@ Thumbs.db
 # Misc local artifacts
 *.log
 test_output.txt
+.dist/
+_export/

@@ -11,7 +11,14 @@ users/trips tables.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import sys
 from contextlib import asynccontextmanager
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,11 +31,34 @@ from app.api.routes import trips as trips_routes
 from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.orchestration.graph import production_graph
+from app.rag.ingest import ensure_ready as ensure_rag_ready
+from app.rag.retrieval import retriever as rag_retriever
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with production_graph() as graph:
+    # Phase 6 - seed the RAG knowledge base before serving traffic, but
+    # NEVER let this block the app from starting: Qdrant might not be up
+    # yet, or the embedding model might need a first-run download that
+    # can't complete (offline environment, registry blocked, whatever) -
+    # any of that should mean "RAG is unavailable this run", exactly
+    # like a missing GROQ_API_KEY means "LLM calls fall back to
+    # heuristics", never "the API won't boot".
+    try:
+        await asyncio.wait_for(ensure_rag_ready(rag_retriever), timeout=60)
+    except Exception as exc:
+        logger.warning("RAG knowledge base not ready at startup (%s) - destination_guide will stay empty", exc)
+
+    async with production_graph() as (checkpointer, graph):
+        # NOTE (21 Aug 2026): app.state.checkpointer is kept alongside
+        # app.state.graph so app/orchestration/graph.py's
+        # rebuild_after_dead_connection() can close the old (broken)
+        # connection and replace both when a request discovers the
+        # checkpointer's connection has died - see that function's
+        # docstring and trips.py's plan_trip() for the recovery path.
+        app.state.checkpointer = checkpointer
         app.state.graph = graph
         yield
 

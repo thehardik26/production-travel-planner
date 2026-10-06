@@ -104,7 +104,23 @@ async def _call_tool_raw(server_url: str, tool_name: str, arguments: dict[str, A
         # confusing "'str' object has no attribute 'get'" instead of a
         # clear error at the source.
         message = result.content[0].text if result.content else "unknown tool error"
-        raise RuntimeError(f"{tool_name} failed on the server: {message}")
+        # NOTE (21 Aug 2026): found via a real user report of a raw,
+        # nested-looking error string reaching the UI ("this looks
+        # childish"). FastMCP itself already wraps an unhandled
+        # exception from the tool function as "Error executing tool
+        # {tool_name}: {original message}" before it ever gets here - so
+        # wrapping it AGAIN with "{tool_name} failed on the server: ..."
+        # produced a message with the tool name and "failed"/"error"
+        # stated three times over by the time research_agent.py added
+        # its own "ResearchAgent: X failed (...)" layer on top. Stripping
+        # FastMCP's own prefix here means callers see just the one real,
+        # human-readable reason (e.g. "Weather forecast for 2026-10-05
+        # isn't available yet - ...") instead of an error-message-about-
+        # an-error-message-about-an-error.
+        fastmcp_prefix = f"Error executing tool {tool_name}: "
+        if message.startswith(fastmcp_prefix):
+            message = message[len(fastmcp_prefix):]
+        raise RuntimeError(message)
 
     if result.structuredContent is not None:
         data = result.structuredContent

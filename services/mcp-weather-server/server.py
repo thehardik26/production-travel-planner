@@ -77,11 +77,28 @@ def _is_nominatim_rate_limit(exc: BaseException) -> bool:
     retry=retry_if_exception(_is_nominatim_rate_limit),
 )
 async def _geocode(city: str) -> tuple[float, float]:
-    """City name -> (lat, lon) via OpenStreetMap Nominatim (free, no key)."""
+    """City name -> (lat, lon) via Open-Meteo Geocoding API with Nominatim fallback."""
     if city in _geocode_cache:
         return _geocode_cache[city]
+
+    # Try Open-Meteo Geocoding API first (fast, keyless, zero bot blocks)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "en", "format": "json"},
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results")
+                if results:
+                    lat, lon = float(results[0]["latitude"]), float(results[0]["longitude"])
+                    _geocode_cache[city] = (lat, lon)
+                    return lat, lon
+    except Exception:
+        pass
+
     user_agent = os.getenv(
-        "OSM_USER_AGENT", "mcp-weather-server/1.0 (set OSM_USER_AGENT in .env)"
+        "OSM_USER_AGENT", "production-travel-planner/1.0 (travel@local.dev)"
     )
     async with httpx.AsyncClient(headers={"User-Agent": user_agent}, timeout=15) as client:
         resp = await client.get(
@@ -97,6 +114,7 @@ async def _geocode(city: str) -> tuple[float, float]:
     return lat, lon
 
 
+
 def _weathercode_to_text(code: int) -> str:
     """Map Open-Meteo's WMO weather code to a simple condition string."""
     if code == 0:
@@ -105,9 +123,18 @@ def _weathercode_to_text(code: int) -> str:
         return "cloudy"
     if code in (45, 48):
         return "foggy"
-    if code in range(51, 68) or code in range(80, 87):
+    # NOTE (21 Aug 2026): found via review - WMO codes 85/86 are "snow
+    # showers" (https://open-meteo.com/en/docs, WMO Weather interpretation
+    # codes table), but range(80, 87) is 80-86 inclusive, which swallowed
+    # 85/86 into "rainy" before the snowy check below ever ran (this
+    # function returns on the first match). A snow-shower forecast was
+    # being shown to the user as rain. Snow codes (71-77 continuous snow,
+    # plus 85/86 snow showers) are now checked together, and the rain
+    # range is narrowed to just the rain-shower codes (80-82) it was
+    # actually meant to cover.
+    if code in range(51, 68) or code in (80, 81, 82):
         return "rainy"
-    if code in range(71, 78):
+    if code in range(71, 78) or code in (85, 86):
         return "snowy"
     if code in range(95, 100):
         return "stormy"

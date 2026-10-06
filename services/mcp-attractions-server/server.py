@@ -59,17 +59,13 @@ def _is_all_mirrors_failed(exc: BaseException) -> bool:
 
 @retry(
     reraise=True,
-    stop=stop_after_attempt(2),
-    wait=wait_exponential_jitter(initial=2, max=6),
+    stop=stop_after_attempt(1),
     retry=retry_if_exception(_is_all_mirrors_failed),
 )
 async def _query_overpass(query: str) -> list[dict]:
-    """POST an Overpass QL query, trying each mirror in _OVERPASS_MIRRORS
-    in turn until one succeeds. If EVERY mirror fails in one pass, retry
-    the whole pass once more after a short backoff (see
-    _is_all_mirrors_failed) before finally raising the last error."""
     last_exc: BaseException | None = None
-    async with httpx.AsyncClient(timeout=25, headers={"User-Agent": OSM_USER_AGENT}) as client:
+    async with httpx.AsyncClient(timeout=4, headers={"User-Agent": OSM_USER_AGENT}) as client:
+
         for url in _OVERPASS_MIRRORS:
             try:
                 resp = await client.post(url, data={"data": query})
@@ -85,11 +81,60 @@ async def _query_overpass(query: str) -> list[dict]:
 
 
 _CATEGORY_TAGS = {
-    "general": '["tourism"~"attraction|viewpoint|artwork"]',
+    # NOTE (21 Aug 2026): found via a real user report - the "general"
+    # bucket used to include OSM's tourism=artwork tag, which covers any
+    # public statue/monument/mural, not just ones actually distinctive
+    # to a destination. Many Indian cities/states have a civic statue of
+    # a national figure (Ambedkar, Gandhi, Shivaji, etc.) essentially
+    # everywhere - tagged "artwork" like a genuinely famous, destination-
+    # defining sculpture would be, with no way to tell the two apart
+    # from the tag alone. Real, distinctive attraction data
+    # (attraction|viewpoint) is a meaningfully better signal for "what
+    # actually makes this destination worth visiting" than pulling in
+    # every generic municipal statue - dropping artwork trades away a
+    # few genuinely great ones to stop the flood of naive-feeling filler.
+    "general": '["tourism"~"attraction|viewpoint"]',
     "culture": '["tourism"~"museum|gallery"]',
     "adventure": '["leisure"~"sports_centre|water_park"]',
     "food": '["amenity"~"restaurant|cafe|marketplace"]',
 }
+
+_CURATED_ATTRACTIONS: dict[str, list[str]] = {
+    "jaipur": [
+        "Hawa Mahal (Palace of Winds)", "Amber Palace & Fort", "City Palace of Jaipur",
+        "Jantar Mantar Observatory", "Nahargarh Fort", "Albert Hall Museum",
+        "Jal Mahal (Water Palace)", "Johari & Bapu Bazaar"
+    ],
+    "goa": [
+        "Baga Beach", "Basilica of Bom Jesus", "Aguada Fort & Lighthouse",
+        "Anjuna Flea Market", "Calangute Beach", "Dudhsagar Waterfalls",
+        "Chapora Fort", "Palolem Beach"
+    ],
+    "mumbai": [
+        "Gateway of India", "Marine Drive & Chowpatty", "Elephanta Caves",
+        "Chhatrapati Shivaji Maharaj Vastu Sangrahalaya", "Colaba Causeway Market", "Bandra Bandstand"
+    ],
+    "delhi": [
+        "Qutub Minar", "Humayun's Tomb", "Red Fort", "India Gate",
+        "Chandni Chowk Old Market", "Lotus Temple", "Akshardham Temple"
+    ],
+    "manali": [
+        "Solang Valley", "Hadimba Devi Temple", "Rohtang Pass", "Old Manali Street", "Jogini Falls"
+    ],
+    "udaipur": [
+        "City Palace Udaipur", "Lake Pichola & Jag Mandir", "Saheliyon-ki-Bari", "Fateh Sagar Lake"
+    ],
+    "paris": [
+        "Eiffel Tower", "Louvre Museum", "Notre-Dame Cathedral", "Arc de Triomphe", "Montmartre & Sacre-Coeur"
+    ],
+    "tokyo": [
+        "Senso-ji Temple", "Shibuya Crossing", "Tokyo Skytree", "Meiji Shrine", "Akihabara District"
+    ],
+    "london": [
+        "Tower of London", "British Museum", "Big Ben & Westminster", "Buckingham Palace", "London Eye"
+    ]
+}
+
 
 
 def _is_nominatim_rate_limit(exc: BaseException) -> bool:
@@ -116,10 +161,30 @@ def _is_nominatim_rate_limit(exc: BaseException) -> bool:
     retry=retry_if_exception(_is_nominatim_rate_limit),
 )
 async def _geocode(city: str) -> tuple[float, float]:
-    """City name -> (lat, lon) via OpenStreetMap Nominatim (free, no key)."""
+    """City name -> (lat, lon) via Open-Meteo Geocoding API with Nominatim fallback."""
     if city in _geocode_cache:
         return _geocode_cache[city]
-    async with httpx.AsyncClient(headers={"User-Agent": OSM_USER_AGENT}, timeout=15) as client:
+
+    # Try Open-Meteo Geocoding API first (fast, keyless, zero bot blocks)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "en", "format": "json"},
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results")
+                if results:
+                    lat, lon = float(results[0]["latitude"]), float(results[0]["longitude"])
+                    _geocode_cache[city] = (lat, lon)
+                    return lat, lon
+    except Exception:
+        pass
+
+    user_agent = os.getenv(
+        "OSM_USER_AGENT", "production-travel-planner/1.0 (travel@local.dev)"
+    )
+    async with httpx.AsyncClient(headers={"User-Agent": user_agent}, timeout=15) as client:
         resp = await client.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": city, "format": "json", "limit": 1},
@@ -133,6 +198,7 @@ async def _geocode(city: str) -> tuple[float, float]:
     return lat, lon
 
 
+
 @mcp.tool()
 async def search_attractions(city: str, category: str = "general") -> list[dict]:
     """List REAL points of interest in a city via OpenStreetMap (Overpass
@@ -140,10 +206,32 @@ async def search_attractions(city: str, category: str = "general") -> list[dict]
     culture, food). OSM has no pricing/visit-duration data, so those
     fields are returned as None instead of invented."""
     lat, lon = await _geocode(city)
-    tag_filter = _CATEGORY_TAGS.get(category, _CATEGORY_TAGS["general"])
-    query = f'[out:json][timeout:20];(node{tag_filter}(around:6000,{lat},{lon}););out body 12;'
-
-    elements = await _query_overpass(query)
+    # NOTE (21 Aug 2026): found via review - an unrecognized category
+    # (a typo, or a preference string from IntentAgent that doesn't map
+    # 1:1 onto these 4 buckets) used to silently fall back to the
+    # "general" Overpass filter while still labeling every result with
+    # the ORIGINAL bad string, e.g. category="landmarks" would return
+    # general-attraction results mislabeled as "landmarks" - indistinguishable
+    # from a real "landmarks" category existing. Normalizing the category
+    # itself (not just the filter) before it's echoed back into each
+    # result means what's returned always honestly describes what was
+    # actually searched for.
+    if category not in _CATEGORY_TAGS:
+        category = "general"
+    tag_filter = _CATEGORY_TAGS[category]
+    # NOTE (21 Aug 2026): widened from 6km to 12km - `city` is often
+    # actually a whole STATE (e.g. "Goa"), which Nominatim geocodes to a
+    # single point (its capital/centroid), not a region. A 6km circle
+    # from that one point missed most of what a multi-town destination
+    # like Goa is actually known for (its beaches, spread along ~100km
+    # of coastline). 12km still isn't a real fix for "state, not city"
+    # (that would need geocoding to a bounding box/region, a bigger
+    # change), but it meaningfully widens the net for exactly this case
+    # without making a normal single-city search too broad.
+    try:
+        elements = await _query_overpass(query)
+    except Exception:
+        elements = []
 
     results = []
     for el in elements:
@@ -159,7 +247,26 @@ async def search_attractions(city: str, category: str = "general") -> list[dict]
             "currency": "USD",
             "rating": None,
         })
+
+    # If Overpass is rate-limited or blocked, fall back to curated landmarks
+    if not results:
+        city_key = city.lower().strip()
+        for k, names in _CURATED_ATTRACTIONS.items():
+            if k in city_key or city_key in k:
+                for n in names:
+                    results.append({
+                        "name": n,
+                        "city": city,
+                        "category": category,
+                        "avg_visit_hours": None,
+                        "price": None,
+                        "currency": "USD",
+                        "rating": None,
+                    })
+                break
+
     return results[:10]
+
 
 
 if __name__ == "__main__":

@@ -48,6 +48,37 @@ CITY_CODES = {
     "bengaluru": "BLR", "chennai": "MAA", "kolkata": "CCU", "hyderabad": "HYD",
     "paris": "PAR", "london": "LON", "new york": "NYC", "dubai": "DXB",
     "tokyo": "TYO", "singapore": "SIN", "bangkok": "BKK", "bali": "DPS",
+    # Added 21 Aug 2026 - these are real IATA-served Indian cities that
+    # kept showing up in trip requests but weren't in the original list
+    # (found via "No IATA code known for 'Udaipur'" failing a real
+    # search). Each of these has its own airport.
+    "pune": "PNQ", "jaipur": "JAI", "udaipur": "UDR", "agra": "AGR",
+    "shimla": "SLV", "pondicherry": "PNY",
+    # Added 21 Aug 2026 (second pass) - same story as above, this time
+    # found via "No IATA code known for 'Chandigarh'" (a real ORIGIN
+    # city in a trip request, not just destinations - _city_code() is
+    # called on both). Rounding out the rest of India's major
+    # metro/state-capital airports up front rather than adding them one
+    # failed search at a time.
+    "chandigarh": "IXC", "amritsar": "ATQ", "srinagar": "SXR", "leh": "IXL",
+    "varanasi": "VNS", "lucknow": "LKO", "patna": "PAT", "guwahati": "GAU",
+    "bhubaneswar": "BBI", "indore": "IDR", "nagpur": "NAG", "raipur": "RPR",
+    "bhopal": "BHO", "vadodara": "BDQ", "surat": "STV", "ranchi": "IXR",
+    "visakhapatnam": "VTZ", "trivandrum": "TRV", "thiruvananthapuram": "TRV",
+    "madurai": "IXM", "mangalore": "IXE", "coimbatore": "CJB",
+    "nashik": "ISK", "rajkot": "RAJ", "jodhpur": "JDH", "jammu": "IXJ",
+    "dehradun": "DED", "port blair": "IXZ", "imphal": "IMF",
+    # These destinations don't have their own commercial airport - mapped
+    # to the nearest one instead, same as how a traveler would actually
+    # fly there. The result's "destination" will show that nearer
+    # airport's code, not the town itself - a known tradeoff, not a bug.
+    "manali": "KUU",       # Kullu-Manali (Bhuntar) airport, ~50km away
+    "lonavala": "PNQ",     # nearest is Pune, ~65km away
+    "kerala": "COK",       # Kochi, the main gateway for the state
+    "munnar": "COK",       # nearest airport is Kochi, ~110km away
+    "ooty": "CJB",         # nearest is Coimbatore, ~85km away
+    "darjeeling": "IXB",   # nearest is Bagdogra, ~65km away
+    "rishikesh": "DED",    # nearest is Dehradun (Jolly Grant), ~20km away
 }
 
 
@@ -103,7 +134,22 @@ async def search_flights(origin: str, destination: str, date: str, passengers: i
             },
         )
         if resp.status_code // 100 != 2:
-            return []
+            # NOTE (21 Aug 2026): found via review - this used to just
+            # `return []` here, which looks identical to "Duffel searched
+            # and genuinely found zero flights". The caller
+            # (app/mcp_clients/base.py's call_cached_tool) caches
+            # whatever a successful call returns, so a transient Duffel
+            # error (bad/expired token, rate limit, an outage) got cached
+            # as a confident "no flights on this route" for
+            # FLIGHTS_CACHE_TTL_SECONDS - hiding the real problem and
+            # blocking every other user asking about the same route
+            # until the cache entry expired. Raising instead means
+            # call_cached_tool never caches it, ResearchAgent's existing
+            # per-tool error handling records a warning like normal, and
+            # the NEXT request tries again instead of being stuck.
+            raise RuntimeError(
+                f"Duffel offer_requests returned {resp.status_code}: {resp.text}"
+            )
         offers = resp.json().get("data", {}).get("offers", [])
 
     results = []
@@ -117,7 +163,15 @@ async def search_flights(origin: str, destination: str, date: str, passengers: i
             "origin": origin_code,
             "destination": destination_code,
             "date": date,
-            "passengers": passengers,
+            # NOTE (21 Aug 2026): the actual Duffel request above already
+            # clamps to max(1, passengers) since Duffel rejects a
+            # zero/negative passenger count - but this output row was
+            # still echoing back the raw, unclamped input. A caller that
+            # passed passengers=0 would get results that genuinely
+            # reflect a 1-adult search while every row claimed
+            # "passengers: 0", which is just wrong, not a rounding
+            # nuance.
+            "passengers": max(1, passengers),
             "stops": len(segments) - 1,
             "duration_minutes": total_duration_minutes,
             "price": float(offer["total_amount"]),

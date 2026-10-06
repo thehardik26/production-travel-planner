@@ -41,7 +41,24 @@ class VerificationAgent:
                 f"({budget_summary.get('budget')} {budget_summary.get('budget_currency')})"
             )
 
-        if state.get("origin") and not state.get("flights"):
+        # NOTE (21 Aug 2026): found via review - ResearchAgent (see its
+        # own file) silently skips flight search entirely when no origin
+        # city was given, since there's nothing to search flights FROM.
+        # That's the right call - it's not a failure - but it used to be
+        # invisible: no flights shown, no budget estimate possible (see
+        # budget_agent.py), and no explanation anywhere for why. This
+        # distinguishes "we didn't even try" (tell the user how to get
+        # flights next time) from "we tried and it genuinely failed"
+        # (the DUFFEL_API_KEY hint below, which is actively MISLEADING
+        # advice when the real reason is simply a missing origin).
+        if not state.get("origin"):
+            warnings.append(
+                "No departure city was given, so flight search (and the budget "
+                'estimate that depends on it) was skipped - mention where you\'re '
+                'traveling FROM (e.g. "...from Mumbai") to see flight options and '
+                "an estimated cost."
+            )
+        elif not state.get("flights"):
             warnings.append("No flight options found - check mcp-flights-server's DUFFEL_API_KEY, or try a different date")
         if not state.get("hotels"):
             warnings.append("No hotel options found - check mcp-hotels-server's GOOGLE_PLACES_API_KEY, or try a different city")

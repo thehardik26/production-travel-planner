@@ -34,8 +34,25 @@ from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.db.database import get_db
 from app.db.models import Trip, User
+from app.orchestration.graph import rebuild_after_dead_connection
 
 router = APIRouter(prefix="/api/trips", tags=["trips"])
+
+
+def _is_dead_connection_error(exc: Exception) -> bool:
+    """True for the specific failure shape a stale/dropped checkpointer
+    connection produces (see app/orchestration/graph.py's NOTE) - a
+    machine sleep/wake, a Postgres/Docker restart, or a network blip
+    killing the ONE long-lived connection LangGraph's checkpointer holds
+    open. Matched on message text (the actual wording libpq/psycopg use
+    for this) rather than a narrow exception type, since psycopg can
+    surface it as more than one exception class depending on exactly
+    when the dead socket is noticed. Deliberately NOT matched for other
+    failures (a bad request, an LLM error already handled inside the
+    graph, an MCP tool timeout) - those should fail normally, not
+    trigger a reconnect-and-retry that won't help them anyway."""
+    text = str(exc).lower()
+    return "server closed the connection" in text or "connection is closed" in text or "connection already closed" in text
 
 
 class TripPlanRequest(BaseModel):
@@ -51,8 +68,16 @@ class TripPlanResponse(BaseModel):
     destination: str | None = None
     start_date: str | None = None
     end_date: str | None = None
+    travelers: int | None = None
     budget_summary: dict | None = None
     itinerary: dict | None = None
+    # NOTE (21 Aug 2026): added so the frontend can render weather and
+    # the Phase 6 destination_guide (RAG) content right after planning,
+    # not just on a later GET /api/trips/{id} - same shape as that
+    # route's `research` key (see get_trip below / stored_itinerary),
+    # so the frontend normalizes both responses identically instead of
+    # needing a re-fetch just to see data the planning call already had.
+    research: dict | None = None
     warnings: list[str] = []
     errors: list[str] = []
 
@@ -89,7 +114,19 @@ async def plan_trip(
     try:
         result = await graph.ainvoke(initial_state, config=config)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"trip planning failed: {exc}") from exc
+        if not _is_dead_connection_error(exc):
+            raise HTTPException(status_code=502, detail=f"trip planning failed: {exc}") from exc
+        # NOTE (21 Aug 2026): the checkpointer's single long-lived
+        # connection died since the last successful request (see
+        # graph.py's NOTE for why that happens on a real dev machine).
+        # Reconnect once and retry THIS request instead of failing it -
+        # and every request after it - until someone notices the app is
+        # broken and restarts the whole process by hand.
+        try:
+            graph = await rebuild_after_dead_connection(request.app.state)
+            result = await graph.ainvoke(initial_state, config=config)
+        except Exception as exc2:
+            raise HTTPException(status_code=502, detail=f"trip planning failed: {exc2}") from exc2
 
     stored_itinerary = {
         "intent": {
@@ -108,6 +145,7 @@ async def plan_trip(
             "hotels": result.get("hotels"),
             "attractions": result.get("attractions"),
             "transport": result.get("transport"),
+            "destination_guide": result.get("destination_guide"),
         },
         "budget_summary": result.get("budget_summary"),
         "itinerary": result.get("itinerary"),
@@ -124,8 +162,10 @@ async def plan_trip(
         destination=result.get("destination"),
         start_date=result.get("start_date"),
         end_date=result.get("end_date"),
+        travelers=result.get("travelers"),
         budget_summary=result.get("budget_summary"),
         itinerary=result.get("itinerary"),
+        research=stored_itinerary["research"],
         warnings=result.get("warnings", []),
         errors=result.get("errors", []),
     )

@@ -1,22 +1,15 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Compass, LogOut } from 'lucide-react'
+import { Compass, LogOut, Sparkles, Radio } from 'lucide-react'
 import { authApi, clearToken, tripsApi } from '../lib/api.js'
 import TripForm from '../components/TripForm.jsx'
 import TripHistorySidebar from '../components/TripHistorySidebar.jsx'
 import TripResult from '../components/TripResult.jsx'
 
-/**
- * The two backend shapes we render here aren't identical:
- * POST /api/trips/plan returns destination/start_date/end_date etc. at
- * the top level, while GET /api/trips/{id} nests the same fields under
- * "intent" (see app/api/routes/trips.py - `stored_itinerary`). Rather
- * than branching in every component, normalize once here so TripResult
- * only ever has to know one shape.
- */
 function normalizeTrip(raw) {
   if (!raw) return null
   const intent = raw.intent || {}
+  const research = raw.research || {}
   return {
     query: raw.query,
     destination: raw.destination ?? intent.destination,
@@ -25,6 +18,10 @@ function normalizeTrip(raw) {
     travelers: raw.travelers ?? intent.travelers,
     budget_summary: raw.budget_summary,
     itinerary: raw.itinerary,
+    weather: research.weather ?? null,
+    flights: research.flights ?? [],
+    hotels: research.hotels ?? [],
+    destinationGuide: research.destination_guide ?? null,
     warnings: raw.warnings || [],
     errors: raw.errors || [],
   }
@@ -39,39 +36,58 @@ export default function DashboardPage() {
   const [selectedTrip, setSelectedTrip] = useState(null)
   const [planning, setPlanning] = useState(false)
   const [planError, setPlanError] = useState('')
+  const latestRequestId = useRef(null)
 
   const loadTrips = useCallback(async () => {
     setTripsLoading(true)
     try {
       const list = await tripsApi.list()
       setTrips(list)
+      if (list.length > 0 && selectedId === null) {
+        setSelectedId(list[0].id)
+        latestRequestId.current = list[0].id
+        const full = await tripsApi.get(list[0].id)
+        setSelectedTrip(normalizeTrip(full))
+      }
     } catch {
-      // History is a nice-to-have, not the core flow - a failed refresh
-      // here shouldn't block planning a new trip.
+      // Background load failures silently handled
     } finally {
       setTripsLoading(false)
+    }
+  }, [selectedId])
+
+  useEffect(() => {
+    let mounted = true
+    authApi
+      .me()
+      .then((u) => {
+        if (mounted) setUser(u)
+      })
+      .catch(() => {
+        // me() failures redirect via unauthorized event
+      })
+    return () => {
+      mounted = false
     }
   }, [])
 
   useEffect(() => {
-    authApi
-      .me()
-      .then(setUser)
-      .catch(() => {
-        clearToken()
-        navigate('/login', { replace: true })
-      })
     loadTrips()
-  }, [navigate, loadTrips])
+  }, [loadTrips])
 
-  async function handleSelectTrip(tripId) {
-    setSelectedId(tripId)
-    setPlanError('')
+  async function handleSelectTrip(id) {
+    if (id === selectedId && selectedTrip) return
+    setSelectedId(id)
+    latestRequestId.current = id
     try {
-      const data = await tripsApi.get(tripId)
-      setSelectedTrip(normalizeTrip(data))
+      const full = await tripsApi.get(id)
+      if (latestRequestId.current === id) {
+        setSelectedTrip(normalizeTrip(full))
+      }
     } catch (err) {
-      setPlanError(err.message)
+      if (latestRequestId.current === id) {
+        setPlanError(err.message)
+      }
     }
   }
 
@@ -95,46 +111,108 @@ export default function DashboardPage() {
     navigate('/login', { replace: true })
   }
 
+  const firstName = user?.email ? user.email.split('@')[0] : null
+  const initial = user?.email ? user.email[0].toUpperCase() : '?'
+
   return (
-    <div className="min-h-screen bg-slate-50">
-      <header className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
-        <div className="flex items-center gap-2">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-white">
-            <Compass className="h-4 w-4" />
+    <div className="min-h-screen text-slate-800">
+      {/* Floating Aesthetic White Navigation Header */}
+      <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/90 backdrop-blur-xl shadow-xs transition-all duration-300">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-3.5">
+          {/* Brand Identity */}
+          <div className="flex items-center gap-3">
+            <div className="relative flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-br from-rose-500 via-orange-500 to-amber-400 text-white shadow-md shadow-rose-500/20">
+              <Compass className="h-5 w-5 transition-transform duration-300 hover:rotate-45" />
+              <div className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white bg-emerald-500" />
+            </div>
+            <div className="flex flex-col">
+              <div className="flex items-center gap-2">
+                <span className="font-display text-xl font-bold tracking-tight text-slate-900">
+                  Aura<span className="text-gradient-coral ml-1">Travel</span>
+                </span>
+                <span className="hidden rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-rose-700 md:inline-flex items-center gap-1">
+                  <Sparkles className="h-2.5 w-2.5 text-amber-500" />
+                  AI Concierge
+                </span>
+              </div>
+            </div>
           </div>
-          <span className="font-semibold tracking-tight text-slate-900">Wanderplan</span>
-        </div>
-        <div className="flex items-center gap-3">
-          {user?.email && <span className="hidden text-sm text-slate-500 sm:inline">{user.email}</span>}
-          <button
-            onClick={handleLogout}
-            className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
-          >
-            <LogOut className="h-4 w-4" />
-            Sign out
-          </button>
+
+          {/* Right Header Navigation & User Profile */}
+          <div className="flex items-center gap-3.5">
+            <div className="hidden lg:flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50/80 px-3 py-1 text-xs font-medium text-emerald-800">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-600" />
+              </span>
+              <span>5 Tool Agents Active</span>
+            </div>
+
+            {user?.email && (
+              <span className="flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50/80 py-1 pl-1 pr-3.5 shadow-2xs">
+                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-gradient-to-tr from-rose-500 to-amber-500 text-xs font-bold text-white shadow-xs">
+                  {initial}
+                </span>
+                <span className="text-xs font-semibold text-slate-700">{user.email}</span>
+              </span>
+            )}
+            <button
+              onClick={handleLogout}
+              className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-semibold text-slate-600 shadow-2xs transition-all duration-200 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            >
+              <LogOut className="h-3.5 w-3.5 text-rose-500" />
+              <span className="hidden sm:inline">Sign out</span>
+            </button>
+          </div>
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-6 py-8 lg:grid-cols-[320px_1fr]">
-        <aside className="space-y-4">
-          <TripForm onSubmit={handlePlan} loading={planning} />
-          <TripHistorySidebar
-            trips={trips}
-            loading={tripsLoading}
-            selectedId={selectedId}
-            onSelect={handleSelectTrip}
-          />
-        </aside>
+      {/* Main Content Area */}
+      <main className="mx-auto max-w-7xl px-6 py-9">
+        <div className="mb-8">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-rose-600">
+            <Radio className="h-3.5 w-3.5 animate-pulse text-amber-500" />
+            <span>Ambient Autonomous Travel Network</span>
+          </div>
+          <h1 className="font-display mt-2 text-3xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
+            {firstName ? (
+              <>
+                Where shall your aura wander,{' '}
+                <span className="text-gradient-sunset">{firstName}</span>?
+              </>
+            ) : (
+              <>
+                Where would you like your aura to{' '}
+                <span className="text-gradient-sunset">wander</span>?
+              </>
+            )}
+          </h1>
+          <p className="mt-2 text-sm text-slate-500 max-w-2xl leading-relaxed">
+            Real-time airline routes, curated stays, live weather telemetry, and intelligent multi-agent itineraries — orchestrated in ambient harmony.
+          </p>
+        </div>
 
-        <section>
-          {planError && (
-            <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-              {planError}
-            </div>
-          )}
-          <TripResult trip={selectedTrip} />
-        </section>
+        <div className="grid grid-cols-1 gap-7 lg:grid-cols-[380px_1fr] lg:items-start">
+          <aside className="space-y-6 lg:sticky lg:top-24">
+            <TripForm onSubmit={handlePlan} loading={planning} />
+            <TripHistorySidebar
+              trips={trips}
+              loading={tripsLoading}
+              selectedId={selectedId}
+              onSelect={handleSelectTrip}
+            />
+          </aside>
+
+          <section>
+            {planError && (
+              <div className="mb-5 rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800 shadow-xs">
+                <p className="font-semibold text-rose-900">Planning notice:</p>
+                <p className="mt-1 text-rose-700">{planError}</p>
+              </div>
+            )}
+            <TripResult trip={selectedTrip} loading={planning} />
+          </section>
+        </div>
       </main>
     </div>
   )

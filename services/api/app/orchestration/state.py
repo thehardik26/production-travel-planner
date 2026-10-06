@@ -42,6 +42,12 @@ class TripPlanningState(TypedDict, total=False):
     attractions: list[dict]
     transport: list[dict]
 
+    # filled by ResearchAgent - Phase 6 RAG lookup, not an MCP tool but
+    # gathered the same way (concurrently, independently failable) -
+    # see app/rag/destination_guide.py. None means "no guide content
+    # found or RAG unavailable", same convention as `weather`.
+    destination_guide: dict | None
+
     # filled by BudgetAgent
     budget_summary: dict | None
 

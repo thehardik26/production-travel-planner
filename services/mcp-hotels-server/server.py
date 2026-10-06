@@ -72,13 +72,30 @@ def _is_nominatim_rate_limit(exc: BaseException) -> bool:
     retry=retry_if_exception(_is_nominatim_rate_limit),
 )
 async def _geocode(city: str) -> tuple[float, float]:
-    """City name -> (lat, lon) via OpenStreetMap Nominatim (free, no
-    key) - same helper used by mcp-weather/attractions/transport-server,
-    reused here because Google Places' Nearby Search needs coordinates,
-    not a city name."""
+    """City name -> (lat, lon) via Open-Meteo Geocoding API with Nominatim fallback."""
     if city in _geocode_cache:
         return _geocode_cache[city]
-    async with httpx.AsyncClient(headers={"User-Agent": OSM_USER_AGENT}, timeout=15) as client:
+
+    # Try Open-Meteo Geocoding API first (fast, keyless, zero bot blocks)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "en", "format": "json"},
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results")
+                if results:
+                    lat, lon = float(results[0]["latitude"]), float(results[0]["longitude"])
+                    _geocode_cache[city] = (lat, lon)
+                    return lat, lon
+    except Exception:
+        pass
+
+    user_agent = os.getenv(
+        "OSM_USER_AGENT", "production-travel-planner/1.0 (travel@local.dev)"
+    )
+    async with httpx.AsyncClient(headers={"User-Agent": user_agent}, timeout=15) as client:
         resp = await client.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": city, "format": "json", "limit": 1},
@@ -90,6 +107,7 @@ async def _geocode(city: str) -> tuple[float, float]:
     lat, lon = float(results[0]["lat"]), float(results[0]["lon"])
     _geocode_cache[city] = (lat, lon)
     return lat, lon
+
 
 
 @mcp.tool()
@@ -106,7 +124,28 @@ async def search_hotels(city: str, check_in: str, check_out: str, guests: int = 
         )
 
     lat, lon = await _geocode(city)
-    nights = max(1, (datetime.fromisoformat(check_out) - datetime.fromisoformat(check_in)).days)
+    # NOTE (21 Aug 2026): found via review - this used to be
+    # `max(1, (check_out - check_in).days)`, which silently turned a
+    # REVERSED date range (check_out before check_in - a genuine bad
+    # request, e.g. a form bug or a user typo) into a confident "1
+    # night" instead of surfacing the mistake.
+    #
+    # NOTE (21 Aug 2026, second pass): the first fix over-corrected -
+    # it rejected check_in == check_out (0 nights) as an error too, but
+    # that's not a mistake, it's a real, common request: a same-day trip
+    # ("1 day trip to Mumbai") has no separate checkout date at all.
+    # Someone planning a day trip might still want to see nearby hotel
+    # options (in case they decide to stay), so this should default to
+    # showing 1 night of options - exactly like before - not error out
+    # and take the whole hotels search down with it. Only a GENUINELY
+    # reversed range (checkout before check-in - impossible, not just
+    # "0 nights") is an actual bad request worth rejecting.
+    nights = (datetime.fromisoformat(check_out) - datetime.fromisoformat(check_in)).days
+    if nights < 0:
+        raise ValueError(
+            f"check_out ({check_out}) is before check_in ({check_in}) - check the dates."
+        )
+    nights = max(1, nights)
 
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(

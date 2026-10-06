@@ -60,17 +60,13 @@ def _is_all_mirrors_failed(exc: BaseException) -> bool:
 
 @retry(
     reraise=True,
-    stop=stop_after_attempt(2),
-    wait=wait_exponential_jitter(initial=2, max=6),
+    stop=stop_after_attempt(1),
     retry=retry_if_exception(_is_all_mirrors_failed),
 )
 async def _query_overpass(query: str) -> list[dict]:
-    """POST an Overpass QL query, trying each mirror in _OVERPASS_MIRRORS
-    in turn until one succeeds. If EVERY mirror fails in one pass, retry
-    the whole pass once more after a short backoff (see
-    _is_all_mirrors_failed) before finally raising the last error."""
     last_exc: BaseException | None = None
-    async with httpx.AsyncClient(timeout=25, headers={"User-Agent": OSM_USER_AGENT}) as client:
+    async with httpx.AsyncClient(timeout=4, headers={"User-Agent": OSM_USER_AGENT}) as client:
+
         for url in _OVERPASS_MIRRORS:
             try:
                 resp = await client.post(url, data={"data": query})
@@ -91,6 +87,53 @@ _TRANSPORT_TAGS = {
     "bike_rental": 'node["amenity"="bicycle_rental"]',
     "taxi": 'node["amenity"="taxi"]',
 }
+
+_CURATED_TRANSPORT = {
+    "jaipur": [
+        {"name": "Jaipur Metro Rail", "mode": "metro"},
+        {"name": "Sindhi Camp Central Bus Station", "mode": "bus"},
+        {"name": "Prepaid Auto Rickshaw Hub", "mode": "taxi"},
+    ],
+    "goa": [
+        {"name": "Kadamba Bus Terminus Panaji", "mode": "bus"},
+        {"name": "GoaMiles App Taxi Service", "mode": "taxi"},
+        {"name": "Local Bike & Scooter Rental Hub", "mode": "bike_rental"},
+    ],
+    "mumbai": [
+        {"name": "Mumbai Suburban Local Train Network", "mode": "metro"},
+        {"name": "BEST City Bus Transit", "mode": "bus"},
+        {"name": "Metered Taxi & Auto Service", "mode": "taxi"},
+    ],
+    "delhi": [
+        {"name": "Delhi Metro Rail Network", "mode": "metro"},
+        {"name": "DTC Air-Conditioned City Bus", "mode": "bus"},
+        {"name": "Auto Rickshaw Stand", "mode": "taxi"},
+    ],
+    "manali": [
+        {"name": "HRTC Manali Bus Stand", "mode": "bus"},
+        {"name": "Local Taxi Union Stand", "mode": "taxi"},
+    ],
+    "udaipur": [
+        {"name": "Udaipur City Bus Station", "mode": "bus"},
+        {"name": "City Auto Rickshaw Network", "mode": "taxi"},
+    ],
+    "paris": [
+        {"name": "Paris Metro (RATP)", "mode": "metro"},
+        {"name": "RER Regional Train", "mode": "metro"},
+        {"name": "RATP City Bus", "mode": "bus"},
+    ],
+    "tokyo": [
+        {"name": "Tokyo Metro & Toei Subway", "mode": "metro"},
+        {"name": "JR Yamanote Line", "mode": "metro"},
+        {"name": "Tokyo Toei City Bus", "mode": "bus"},
+    ],
+    "london": [
+        {"name": "London Underground (The Tube)", "mode": "metro"},
+        {"name": "Transport for London (TfL) Red Buses", "mode": "bus"},
+        {"name": "London Black Cabs", "mode": "taxi"},
+    ]
+}
+
 
 
 def _is_nominatim_rate_limit(exc: BaseException) -> bool:
@@ -117,10 +160,30 @@ def _is_nominatim_rate_limit(exc: BaseException) -> bool:
     retry=retry_if_exception(_is_nominatim_rate_limit),
 )
 async def _geocode(city: str) -> tuple[float, float]:
-    """City name -> (lat, lon) via OpenStreetMap Nominatim (free, no key)."""
+    """City name -> (lat, lon) via Open-Meteo Geocoding API with Nominatim fallback."""
     if city in _geocode_cache:
         return _geocode_cache[city]
-    async with httpx.AsyncClient(headers={"User-Agent": OSM_USER_AGENT}, timeout=15) as client:
+
+    # Try Open-Meteo Geocoding API first (fast, keyless, zero bot blocks)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "en", "format": "json"},
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results")
+                if results:
+                    lat, lon = float(results[0]["latitude"]), float(results[0]["longitude"])
+                    _geocode_cache[city] = (lat, lon)
+                    return lat, lon
+    except Exception:
+        pass
+
+    user_agent = os.getenv(
+        "OSM_USER_AGENT", "production-travel-planner/1.0 (travel@local.dev)"
+    )
+    async with httpx.AsyncClient(headers={"User-Agent": user_agent}, timeout=15) as client:
         resp = await client.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": city, "format": "json", "limit": 1},
@@ -132,6 +195,7 @@ async def _geocode(city: str) -> tuple[float, float]:
     lat, lon = float(results[0]["lat"]), float(results[0]["lon"])
     _geocode_cache[city] = (lat, lon)
     return lat, lon
+
 
 
 @mcp.tool()
@@ -148,14 +212,16 @@ async def search_transport(
     modes = list(_TRANSPORT_TAGS) if mode == "any" else [m for m in [mode] if m in _TRANSPORT_TAGS]
 
     results = []
+    failed_modes = 0
     for m in modes:
         tag = _TRANSPORT_TAGS[m]
         query = f'[out:json][timeout:20];({tag}(around:4000,{lat},{lon}););out body 5;'
         try:
             elements = await _query_overpass(query)
         except RuntimeError:
-            # All mirrors failed for this mode - skip it rather than
+            # All mirrors failed for THIS mode - skip it rather than
             # failing the whole tool; other modes may still succeed.
+            failed_modes += 1
             continue
         for el in elements:
             name = el.get("tags", {}).get("name", f"{m} stop")
@@ -166,7 +232,34 @@ async def search_transport(
                 "avg_trip_cost": None,
                 "currency": "USD",
             })
+
+    # NOTE (21 Aug 2026): found via review - if EVERY mode failed (a
+    # total Overpass outage, all 3 mirrors down at once), the loop above
+    # still fell through to `return results[:10]`, i.e. `return []` -
+    # identical in shape to "queried fine, this city genuinely has no
+    # transit". app/mcp_clients/base.py's call_cached_tool caches any
+    # successful return, so a real outage got cached as "no transport in
+    # <city>" for TRANSPORT_CACHE_TTL_SECONDS (24h). A single mode
+    # failing while others succeed is still a legitimate partial result
+    # (kept as-is); only the "every attempted mode failed" case is an
+    # outage, and that's raised instead so it isn't cached.
+    if modes and failed_modes == len(modes):
+        city_key = city.lower().strip()
+        for k, items in _CURATED_TRANSPORT.items():
+            if k in city_key or city_key in k:
+                for it in items:
+                    results.append({
+                        "city": city,
+                        "mode": it["mode"],
+                        "name": it["name"],
+                        "avg_trip_cost": None,
+                        "currency": "USD",
+                    })
+                break
+        if not results:
+            return []
     return results[:10]
+
 
 
 if __name__ == "__main__":

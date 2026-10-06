@@ -1,12 +1,29 @@
 """
-Groq LLM client wrapper - the first place in this codebase that talks to
-an actual language model (everything before Phase 5 was deterministic
-code: auth, MCP tool calls, caching).
+LLM client wrapper - the first place in this codebase that talks to an
+actual language model (everything before Phase 5 was deterministic code:
+auth, MCP tool calls, caching).
 
-Groq's API is OpenAI-compatible (same request/response shape), and its
-free tier needs only a signup + API key, no billing - see
-https://console.groq.com. Model default is llama-3.3-70b-versatile
-(good balance of quality/speed on Groq's free tier).
+Two interchangeable providers, picked by settings.LLM_PROVIDER:
+
+  - "groq" (default): Groq's API is OpenAI-compatible (same request/
+    response shape), and its free tier needs only a signup + API key, no
+    billing - see https://console.groq.com. Model default is
+    llama-3.3-70b-versatile.
+  - "openai": for when a Groq model name gets deprecated/renamed out
+    from under GROQ_MODEL (this has happened - see the 21 Aug 2026 note
+    below), or when someone would rather spend OpenAI credits they
+    already have. Needs OPENAI_API_KEY.
+
+Both SDKs expose the identical `.chat.completions.create(...)` shape
+(Groq's client is a fork of OpenAI's), so swapping providers is just
+swapping which client class gets constructed - `chat_json()` itself
+doesn't change.
+
+NOTE (21 Aug 2026): hit in the wild - Groq deprecated/renamed the model
+behind the old GROQ_MODEL default, so every LLM call started failing
+with a 404 "model does not exist" until GROQ_MODEL (or LLM_PROVIDER) was
+updated. Worth checking https://console.groq.com/docs/models for the
+current model list if this happens again.
 
 `chat_json()` is the one function every LLM-using agent calls: give it a
 system prompt + user prompt, get back a parsed dict. response_format is
@@ -18,27 +35,49 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from groq import AsyncGroq
-
 from app.core.config import settings
 
-_client: AsyncGroq | None = None
+_client: Any = None
 
 
-def _get_client() -> AsyncGroq:
-    """Lazy singleton - constructing AsyncGroq with an empty api_key
-    would fail at import time for anyone running without a key yet
-    (e.g. during early local setup, or in tests that never call an
+def _get_client() -> Any:
+    """Lazy singleton - constructing a provider client with an empty
+    api_key would fail at import time for anyone running without a key
+    yet (e.g. during early local setup, or in tests that never call an
     agent that needs the LLM)."""
     global _client
-    if _client is None:
+    if _client is not None:
+        return _client
+
+    provider = settings.LLM_PROVIDER.lower()
+    if provider == "openai":
+        if not settings.OPENAI_API_KEY:
+            raise RuntimeError(
+                "LLM_PROVIDER is 'openai' but OPENAI_API_KEY is not set. "
+                "Add it to services/api/.env."
+            )
+        from openai import AsyncOpenAI
+
+        _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    elif provider == "groq":
         if not settings.GROQ_API_KEY:
             raise RuntimeError(
-                "GROQ_API_KEY not set. Get a free key at "
-                "https://console.groq.com and put it in services/api/.env"
+                "LLM_PROVIDER is 'groq' but GROQ_API_KEY is not set. Get a "
+                "free key at https://console.groq.com and put it in "
+                "services/api/.env."
             )
+        from groq import AsyncGroq
+
         _client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+    else:
+        raise RuntimeError(f"Unknown LLM_PROVIDER {provider!r} - expected 'groq' or 'openai'.")
+
     return _client
+
+
+def _get_model_name() -> str:
+    provider = settings.LLM_PROVIDER.lower()
+    return settings.OPENAI_MODEL if provider == "openai" else settings.GROQ_MODEL
 
 
 async def chat_json(system_prompt: str, user_prompt: str, *, temperature: float = 0.2) -> dict[str, Any]:
@@ -48,7 +87,7 @@ async def chat_json(system_prompt: str, user_prompt: str, *, temperature: float 
     the error, this function does not silently swallow anything."""
     client = _get_client()
     response = await client.chat.completions.create(
-        model=settings.GROQ_MODEL,
+        model=_get_model_name(),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
